@@ -17,7 +17,10 @@ import (
 	"sync"
 	"syscall"
 
-	ss "github.com/shadowsocks/shadowsocks-go/shadowsocks"
+	//ss "github.com/shadowsocks/shadowsocks-go/shadowsocks"
+	ss "../../shadowsocks"
+	"net/http"
+	"io/ioutil"
 )
 
 const (
@@ -39,7 +42,7 @@ const (
 var debug ss.DebugLog
 var udp bool
 
-func getRequest(conn *ss.Conn, auth bool) (host string, ota bool, err error) {
+func getRequest(conn *ss.Conn, auth bool) (rawAddr []byte, host string, ota bool, err error) {
 	ss.SetReadTimeout(conn)
 
 	// buf size should at least have the same size with the largest possible
@@ -53,6 +56,7 @@ func getRequest(conn *ss.Conn, auth bool) (host string, ota bool, err error) {
 
 	var reqStart, reqEnd int
 	addrType := buf[idType]
+	reqLen := -1
 	switch addrType & ss.AddrMask {
 	case typeIPv4:
 		reqStart, reqEnd = idIP0, idIP0+lenIPv4
@@ -67,6 +71,9 @@ func getRequest(conn *ss.Conn, auth bool) (host string, ota bool, err error) {
 		err = fmt.Errorf("addr type %d not supported", addrType&ss.AddrMask)
 		return
 	}
+
+	reqLen = reqEnd - idType
+	fmt.Println("req:",reqLen, idType, reqEnd )
 
 	if _, err = io.ReadFull(conn, buf[reqStart:reqEnd]); err != nil {
 		return
@@ -83,6 +90,8 @@ func getRequest(conn *ss.Conn, auth bool) (host string, ota bool, err error) {
 	case typeDm:
 		host = string(buf[idDm0 : idDm0+int(buf[idDmLen])])
 	}
+	rawAddr = buf[idType:reqLen]
+	fmt.Println("rawaddr ", len(rawAddr), " : ", rawAddr)
 	// parse port
 	port := binary.BigEndian.Uint16(buf[reqEnd-2 : reqEnd])
 	host = net.JoinHostPort(host, strconv.Itoa(int(port)))
@@ -108,7 +117,54 @@ const logCntDelta = 100
 var connCnt int
 var nextLogConnCnt int = logCntDelta
 
-func handleConnection(conn *ss.Conn, auth bool) {
+func testHttp(fin chan int, response *string) {
+	resp, err := http.Get("http://www.baidu.com")
+	if err != nil{
+		fin<- -1
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 200 { // OK
+		bodyBytes, _ := ioutil.ReadAll(resp.Body)
+		*response = string(bodyBytes)
+
+		fin<- 0
+	}
+	fin<- resp.StatusCode
+}
+
+func connectToServer(rawaddr []byte, addr string) (remote *ss.Conn, err error) {
+	//se := servers.srvCipher[serverId]
+	remote, err = ss.DialWithRawAddr(rawaddr, proxyServer, serverCipher.Copy())
+	if err != nil {
+		log.Println("error connecting to shadowsocks server:", err)
+		const maxFailCnt = 30
+		//if servers.failCnt[serverId] < maxFailCnt {
+		//	servers.failCnt[serverId]++
+		//}
+		return nil, err
+	}
+	debug.Printf("connected to %s via %s\n", addr, proxyServer)
+	//servers.failCnt[serverId] = 0
+	return
+}
+
+// Connection to the server in the order specified in the config. On
+// connection failure, try the next server. A failed server will be tried with
+// some probability according to its fail count, so we can discover recovered
+// servers.
+func createServerConn(rawaddr []byte, addr string) (remote *ss.Conn, err error) {
+	const baseFailCnt = 20
+
+	remote, err = connectToServer(rawaddr, addr)
+	if err == nil {
+		return
+	}
+
+	return nil, err
+}
+
+
+func handleConnection(conn *ss.Conn, auth bool, config *ss.Config) {
 	var host string
 
 	connCnt++ // this maybe not accurate, but should be enough
@@ -136,20 +192,125 @@ func handleConnection(conn *ss.Conn, auth bool) {
 		}
 	}()
 
-	host, ota, err := getRequest(conn, auth)
+	rawAddr, host, ota, err := getRequest(conn, auth)
 	if err != nil {
 		log.Println("error getting request", conn.RemoteAddr(), conn.LocalAddr(), err)
 		closed = true
 		return
 	}
+
+	//	gowinder test http client api
+	if false{
+		chan_fin := make(chan int)
+		var response string
+		go testHttp(chan_fin, &response)
+
+		http_get_error_code := <-chan_fin
+		if http_get_error_code == 0{
+			fmt.Println("%d", response)
+		}
+	}
+
+
+
+
 	// ensure the host does not contain some illegal characters, NUL may panic on Win32
 	if strings.ContainsRune(host, 0x00) {
 		log.Println("invalid domain name.")
 		closed = true
 		return
 	}
-	debug.Println("connecting", host)
-	remote, err := net.Dial("tcp", host)
+
+	if config.Proxy{
+		debug.Println("connecting to proxy", host)
+		remote, err := createServerConn(rawAddr, proxyServer)
+		if err != nil {
+			//if len(servers.srvCipher) > 1 {
+			//	log.Println("Failed connect to all avaiable shadowsocks server")
+			//}
+			log.Println("faild connect to proxy server")
+			return
+		}
+		defer func() {
+			if !closed {
+				remote.Close()
+			}
+		}()
+
+		if debug {
+			debug.Printf("piping %s<->%s ota=%v connOta=%v", conn.RemoteAddr(), host, ota, conn.IsOta())
+		}
+		if ota {
+			go ss.PipeThenCloseOta(conn, remote)
+		} else {
+			go ss.PipeThenClose(conn, remote)
+		}
+		ss.PipeThenClose(remote, conn)
+		closed = true
+	}else{
+		debug.Println("connecting", host)
+		remote, err := net.Dial("tcp", host)
+		if err != nil {
+			if ne, ok := err.(*net.OpError); ok && (ne.Err == syscall.EMFILE || ne.Err == syscall.ENFILE) {
+				// log too many open file error
+				// EMFILE is process reaches open file limits, ENFILE is system limit
+				log.Println("dial error:", err)
+			} else {
+				log.Println("error connecting to:", host, err)
+			}
+			return
+		}
+		defer func() {
+			if !closed {
+				remote.Close()
+			}
+		}()
+		if debug {
+			debug.Printf("piping %s<->%s ota=%v connOta=%v", conn.RemoteAddr(), host, ota, conn.IsOta())
+		}
+		if ota {
+			go ss.PipeThenCloseOta(conn, remote)
+		} else {
+			go ss.PipeThenClose(conn, remote)
+		}
+		ss.PipeThenClose(remote, conn)
+		closed = true
+	}
+
+	return
+}
+
+
+
+func handleConnectionRedir(conn *ss.Conn, auth bool, config *ss.Config) {
+	var host string
+
+	connCnt++ // this maybe not accurate, but should be enough
+	if connCnt-nextLogConnCnt >= 0 {
+		// XXX There's no xadd in the atomic package, so it's difficult to log
+		// the message only once with low cost. Also note nextLogConnCnt maybe
+		// added twice for current peak connection number level.
+		log.Printf("Number of client connections reaches %d\n", nextLogConnCnt)
+		nextLogConnCnt += logCntDelta
+	}
+
+	// function arguments are always evaluated, so surround debug statement
+	// with if statement
+	if debug {
+		debug.Printf("new client %s->%s\n", conn.RemoteAddr().String(), conn.LocalAddr())
+	}
+	closed := false
+	defer func() {
+		if debug {
+			debug.Printf("closed pipe %s<->%s\n", conn.RemoteAddr(), host)
+		}
+		connCnt--
+		if !closed {
+			conn.Close()
+		}
+	}()
+
+	remote, err := net.Dial("tcp", proxyServer)
 	if err != nil {
 		if ne, ok := err.(*net.OpError); ok && (ne.Err == syscall.EMFILE || ne.Err == syscall.ENFILE) {
 			// log too many open file error
@@ -165,18 +326,15 @@ func handleConnection(conn *ss.Conn, auth bool) {
 			remote.Close()
 		}
 	}()
-	if debug {
-		debug.Printf("piping %s<->%s ota=%v connOta=%v", conn.RemoteAddr(), host, ota, conn.IsOta())
-	}
-	if ota {
-		go ss.PipeThenCloseOta(conn, remote)
-	} else {
-		go ss.PipeThenClose(conn, remote)
-	}
+
+
+	go ss.PipeThenClose(conn, remote)
 	ss.PipeThenClose(remote, conn)
 	closed = true
+
 	return
 }
+
 
 type PortListener struct {
 	password string
@@ -258,7 +416,7 @@ func (pm *PasswdManager) updatePortPasswd(port, password string, auth bool) {
 	}
 	// run will add the new port listener to passwdManager.
 	// So there maybe concurrent access to passwdManager and we need lock to protect it.
-	go run(port, password, auth)
+//	go run(port, password, auth)
 	if udp {
 		pl, _ := pm.getUDP(port)
 		pl.listener.Close()
@@ -309,7 +467,7 @@ func waitSignal() {
 	}
 }
 
-func run(port, password string, auth bool) {
+func run(port, password string, auth bool, config *ss.Config) {
 	ln, err := net.Listen("tcp", ":"+port)
 	if err != nil {
 		log.Printf("error listening port %v: %v\n", port, err)
@@ -335,7 +493,8 @@ func run(port, password string, auth bool) {
 				continue
 			}
 		}
-		go handleConnection(ss.NewConn(conn, cipher.Copy()), auth)
+		go handleConnection(ss.NewConn(conn, cipher.Copy()), auth, config)
+		//go handleConnectionRedir(ss.NewConn(conn, cipher.Copy()), auth, config)
 	}
 }
 
@@ -388,6 +547,25 @@ func unifyPortPassword(config *ss.Config) (err error) {
 
 var configFile string
 var config *ss.Config
+
+//	add by gowinder as client chipper for server
+var serverCipher *ss.Cipher
+var proxyServer string
+
+func updateClientChipper(config* ss.Config){
+	method := config.Method
+	if config.Auth {
+		method += "-auth"
+	}
+	// only one encryption table
+	cipher, err := ss.NewCipher(method, config.Password)
+	if err != nil {
+		log.Fatal("Failed generating ciphers:", err)
+	}
+	serverCipher = cipher
+
+	proxyServer = net.JoinHostPort(config.ProxyServer, strconv.Itoa(config.ProxyPort))
+}
 
 func main() {
 	log.SetOutput(os.Stdout)
@@ -444,8 +622,12 @@ func main() {
 	if core > 0 {
 		runtime.GOMAXPROCS(core)
 	}
+
+	//	gowinder
+	updateClientChipper(config)
+
 	for port, password := range config.PortPassword {
-		go run(port, password, config.Auth)
+		go run(port, password, config.Auth, config)
 		if udp {
 			go runUDP(port, password, config.Auth)
 		}

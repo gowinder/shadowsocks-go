@@ -25,6 +25,9 @@ type Config struct {
 	Password   string      `json:"password"`
 	Method     string      `json:"method"` // encryption method
 	Auth       bool        `json:"auth"`   // one time auth
+	Proxy		bool		`json:"proxy"`
+	ProxyServer	string	`json:"proxy_server"`
+	ProxyPort	int		`json:"proxy_port"`
 
 	// following options are only used by server
 	PortPassword map[string]string `json:"port_password"`

@@ -1,0 +1,14 @@
+<component name="libraryTable">
+  <library name="GOPATH &lt;shadowsocks-go&gt;">
+    <CLASSES>
+      <root url="file:///usr/local/Cellar/go/1.7.3/src/github.com" />
+    </CLASSES>
+    <JAVADOC />
+    <SOURCES>
+      <root url="file:///usr/local/Cellar/go/1.7.3/src/github.com" />
+    </SOURCES>
+    <excluded>
+      <root url="file://$PROJECT_DIR$" />
+    </excluded>
+  </library>
+</component>
